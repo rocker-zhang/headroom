@@ -116,10 +116,11 @@ def _default_vertex_app() -> Any:
 
 
 def test_vertex_rawpredict_anthropic_runs_compression_handler(monkeypatch) -> None:
-    captured: dict[str, Any] = {}
+    captured: dict[str, str] = {}
 
-    async def fake(self, request, *args):  # type: ignore[no-untyped-def]
-        captured["args"] = [str(a) for a in args]
+    # The route calls handle_anthropic_messages(request, base_url, provider, model).
+    async def fake(self, request, base_url, provider, model, *rest):  # type: ignore[no-untyped-def]
+        captured.update(base_url=str(base_url), provider=str(provider), model=str(model))
         return JSONResponse({"ok": True})
 
     monkeypatch.setattr(HeadroomProxy, "handle_anthropic_messages", fake)
@@ -132,6 +133,8 @@ def test_vertex_rawpredict_anthropic_runs_compression_handler(monkeypatch) -> No
         )
     assert resp.status_code == 200
     # The anthropic publisher is routed to the compression handler (not the
-    # verbatim passthrough), with the region-derived upstream host.
-    assert "vertex:anthropic" in captured["args"]
-    assert "https://europe-west1-aiplatform.googleapis.com" in captured["args"]
+    # verbatim passthrough), with the region-derived upstream host (exact match,
+    # not a substring check).
+    assert captured["provider"] == "vertex:anthropic"
+    assert captured["base_url"] == "https://europe-west1-aiplatform.googleapis.com"
+    assert captured["model"] == "claude-sonnet-4-6"
