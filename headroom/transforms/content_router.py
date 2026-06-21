@@ -648,6 +648,33 @@ class ContentRouterConfig:
         0.0  # 0.0 = protect ALL excluded-tool outputs (safest for coding agents)
     )
 
+    # Stale Read/Glob compression: compress excluded-tool outputs (Read, Glob,
+    # Grep) that are older than N turns from the end of the conversation.
+    # "Turns" here = user+assistant exchange pairs; a message is stale when
+    # messages_from_end > stale_read_compress_after_turns * 2.
+    # 0   = disabled (no excluded-tool outputs ever compressed by this rule —
+    #       falls back to the protect_recent_reads_fraction heuristic, which is
+    #       itself 0.0 by default, so the net default is "protect everything").
+    # 999 = never compress any (explicit backward-compat escape hatch).
+    # Env var: HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS (default 0 = off).
+    stale_read_compress_after_turns: int = field(
+        default_factory=lambda: int(
+            os.environ.get("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0")
+        )
+    )
+
+    # Compression stability pinning: in the first N turns of a session, use a
+    # conservative mode that skips ML-based (non-deterministic) Kompress on tool
+    # outputs. This prevents turn-to-turn compression variance from busting the
+    # upstream provider's prefix cache while the session is building its prefix.
+    # 0 = disabled (all turns get full compression — previous behavior).
+    # Env var: HEADROOM_COMPRESSION_STABLE_AFTER_TURN (default 0 = off).
+    compression_stable_after_turn: int = field(
+        default_factory=lambda: int(
+            os.environ.get("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0")
+        )
+    )
+
     # Adaptive compression ratio: scales with context pressure.
     # At low pressure (<30% full), use the relaxed threshold (reject marginal).
     # At high pressure (>80% full), use the aggressive threshold (accept anything helpful).
@@ -1051,6 +1078,71 @@ class ContentRouter(Transform):
         """Compress with wall-clock timing.  Used by parallel executor."""
         t0 = time.perf_counter()
         result = self.compress(content, context=context, bias=bias)
+        return result, (time.perf_counter() - t0) * 1000
+
+    def _compress_conservative(
+        self,
+        content: str,
+        context: str = "",
+        bias: float = 1.0,
+    ) -> RouterCompressionResult:
+        """Compress using only deterministic strategies (no ML/Kompress).
+
+        Used during the compression stability phase (first N turns) to avoid
+        non-deterministic Kompress output varying turn-to-turn and busting the
+        upstream provider's prefix cache.
+
+        Deterministic strategies allowed: SmartCrusher, SearchCompressor,
+        LogCompressor, DiffCompressor, HTMLExtractor, CodeAwareCompressor,
+        TabularCompressor. Stochastic strategies skipped: Kompress (ML-based
+        ModernBERT), and TEXT/MIXED which route through Kompress internally.
+        """
+        if not content or not content.strip():
+            return RouterCompressionResult(
+                compressed=content,
+                original=content,
+                strategy_used=CompressionStrategy.PASSTHROUGH,
+                routing_log=[],
+            )
+
+        strategy = self._determine_strategy(content)
+
+        # If routing selected a Kompress-based (non-deterministic) strategy,
+        # pass through unchanged. Kompress can produce different compressed
+        # output across calls for the same input, which invalidates the
+        # upstream prefix cache. TEXT and MIXED also fan out to Kompress, so
+        # they are treated as conservatively non-compressible here.
+        if strategy in (
+            CompressionStrategy.KOMPRESS,
+            CompressionStrategy.TEXT,
+            CompressionStrategy.MIXED,
+            CompressionStrategy.PASSTHROUGH,
+        ):
+            original_tokens = len(content.split())
+            return RouterCompressionResult(
+                compressed=content,
+                original=content,
+                strategy_used=CompressionStrategy.PASSTHROUGH,
+                routing_log=[
+                    RoutingDecision(
+                        content_type=self._content_type_from_strategy(strategy),
+                        strategy=CompressionStrategy.PASSTHROUGH,
+                        original_tokens=original_tokens,
+                        compressed_tokens=original_tokens,
+                    )
+                ],
+            )
+
+        # For other strategies (SmartCrusher, Search, Log, Diff, HTML,
+        # Tabular, CodeAware), compression is deterministic — allow it.
+        return self._compress_pure(content, strategy, context, question=None, bias=bias)
+
+    def _timed_compress_conservative(
+        self, content: str, context: str, bias: float
+    ) -> tuple[RouterCompressionResult, float]:
+        """Conservative compress with wall-clock timing.  Used by parallel executor."""
+        t0 = time.perf_counter()
+        result = self._compress_conservative(content, context=context, bias=bias)
         return result, (time.perf_counter() - t0) * 1000
 
     def compress(
@@ -2325,8 +2417,27 @@ class ContentRouter(Transform):
         num_messages = len(messages)
         model_limit = kwargs.get("model_limit", 0)
 
-        # Adaptive Read protection: protect a fraction of recent messages
-        if self.config.protect_recent_reads_fraction > 0:
+        # Approximate session turn count: each turn = 1 user + 1 assistant
+        # message. Used for stability pinning and stale-read decisions.
+        session_turn_count = max(1, num_messages // 2)
+
+        # Stale Read/Glob compression: prefer the explicit turn-count threshold
+        # over the fraction-based heuristic when configured (non-zero).
+        #   stale_read_compress_after_turns=N → protect last N turns (2*N msgs),
+        #     allow compression for older Read/Glob outputs.
+        #   stale_read_compress_after_turns=0   → fall back to fraction logic
+        #     (default 0.0 fraction → protect all → byte-identical old behavior).
+        #   stale_read_compress_after_turns=999 → protect everything (explicit
+        #     backward-compat escape hatch).
+        stale_turns = self.config.stale_read_compress_after_turns
+        if stale_turns == 999:
+            # Backward-compat: protect all excluded-tool outputs
+            read_protection_window = num_messages
+        elif stale_turns > 0:
+            # Convert turns to messages (2 messages per turn: user + assistant)
+            read_protection_window = stale_turns * 2
+        elif self.config.protect_recent_reads_fraction > 0:
+            # Adaptive Read protection: protect a fraction of recent messages.
             # Scale: at 10 msgs protect 5, at 50 msgs protect 25, at 200 msgs protect 100
             # But cap at a reasonable floor so very short convos still protect everything
             read_protection_window = max(
@@ -2338,6 +2449,12 @@ class ContentRouter(Transform):
         runtime_read_protection_window = kwargs.get("read_protection_window")
         if runtime_read_protection_window is not None:
             read_protection_window = max(0, int(runtime_read_protection_window))
+
+        # Compression stability: in early turns, skip ML-based (non-deterministic)
+        # compression on tool outputs to prevent prefix-cache busting.
+        # 0 (default) → never in stability phase → byte-identical old behavior.
+        stable_after = self.config.compression_stable_after_turn
+        in_stability_phase = stable_after > 0 and session_turn_count <= stable_after
 
         # Adaptive compression ratio: scale with context pressure
         if model_limit > 0:
@@ -2441,8 +2558,9 @@ class ContentRouter(Transform):
                     ttl = _net_cost_cache_ttl_seconds()
                     netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
 
-        # Tasks: list of (slot_index, content, context, bias, content_key)
-        _PendingTask = tuple[int, str, str, float, int]
+        # Tasks: list of (slot_index, content, context, bias, content_key, conservative)
+        # conservative=True means skip ML-based compression (stability phase for tool msgs)
+        _PendingTask = tuple[int, str, str, float, int, bool]
         pending_tasks: list[_PendingTask] = []
 
         # #856 P2b (flag-gated, default off): net-cost frozen-floor unlock.
@@ -2499,6 +2617,7 @@ class ContentRouter(Transform):
                     skip_user=skip_user,
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
+                    conservative=in_stability_phase,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -2655,10 +2774,13 @@ class ContentRouter(Transform):
                 route_counts["cache_hit"] += 1
                 continue
 
-            # Cache miss — defer to parallel compression pass
+            # Cache miss — defer to parallel compression pass.
+            # In the stability phase, mark tool messages for conservative
+            # (no-Kompress) mode so early-turn tool output stays byte-stable.
             route_counts.setdefault("cache_miss", 0)
             route_counts["cache_miss"] += 1
-            pending_tasks.append((i, content, context, msg_bias, content_key))
+            conservative = in_stability_phase and role == "tool"
+            pending_tasks.append((i, content, context, msg_bias, content_key, conservative))
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
@@ -2670,27 +2792,52 @@ class ContentRouter(Transform):
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _ in pending_tasks:
+                for _, task_content, task_ctx, task_bias, _, task_conservative in pending_tasks:
                     t0 = time.perf_counter()
-                    r = self.compress(task_content, context=task_ctx, bias=task_bias)
+                    if task_conservative:
+                        r = self._compress_conservative(
+                            task_content, context=task_ctx, bias=task_bias
+                        )
+                    else:
+                        r = self.compress(task_content, context=task_ctx, bias=task_bias)
                     task_results.append((r, (time.perf_counter() - t0) * 1000))
             else:
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
-                    for _, task_content, task_ctx, task_bias, _ in pending_tasks:
-                        futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
-                        )
+                    for (
+                        _,
+                        task_content,
+                        task_ctx,
+                        task_bias,
+                        _,
+                        task_conservative,
+                    ) in pending_tasks:
+                        if task_conservative:
+                            futures.append(
+                                executor.submit(
+                                    self._timed_compress_conservative,
+                                    task_content,
+                                    task_ctx,
+                                    task_bias,
+                                )
+                            )
+                        else:
+                            futures.append(
+                                executor.submit(
+                                    self._timed_compress, task_content, task_ctx, task_bias
+                                )
+                            )
                     task_results = [f.result() for f in futures]
 
             parallel_ms = (time.perf_counter() - t_parallel_start) * 1000
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, task_content, _, _, content_key), (result, compress_ms) in zip(
-                pending_tasks, task_results
-            ):
+            for (slot_idx, task_content, _, _, content_key, task_conservative), (
+                result,
+                compress_ms,
+            ) in zip(pending_tasks, task_results):
                 message = messages[slot_idx]
                 strategy_key = f"compressor:{result.strategy_used.value}"
                 compressor_timing[strategy_key] = (
@@ -2732,8 +2879,12 @@ class ContentRouter(Transform):
                         route_counts.setdefault("netcost_frozen_unlocked", 0)
                         route_counts["netcost_frozen_unlocked"] += 1
                 else:
-                    # Didn't compress — add to skip set
-                    self._cache.mark_skip(content_key)
+                    # Didn't compress. If this was a conservative (stability-phase)
+                    # passthrough, do NOT add to the skip set — the content may be
+                    # compressible via Kompress once the stability phase ends.
+                    # Only mark_skip for genuine non-compressible content (full mode).
+                    if not task_conservative:
+                        self._cache.mark_skip(content_key)
                     result_slots[slot_idx] = message
                     route_counts["ratio_too_high"] += 1
 
@@ -2772,6 +2923,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['cache_hit']} cache hits")
         if route_counts.get("cache_miss"):
             parts.append(f"{route_counts['cache_miss']} cache misses")
+        if in_stability_phase:
+            parts.append(f"stability-phase (turn~{session_turn_count}/{stable_after})")
         if route_counts.get("netcost_batch_admitted"):
             parts.append(f"{route_counts['netcost_batch_admitted']} netcost batch-admitted")
         if route_counts.get("netcost_idle_admitted"):
@@ -2852,6 +3005,7 @@ class ContentRouter(Transform):
         skip_user: bool = True,
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
+        conservative: bool = False,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -3000,6 +3154,7 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         strategy_label="tool_result",
                         details_prefix="tool",
+                        conservative=conservative,
                     )
                     if compressed_content is not None:
                         new_blocks.append({**block, "content": compressed_content})
@@ -3076,6 +3231,7 @@ class ContentRouter(Transform):
         compressed_details: list[str] | None,
         strategy_label: str,
         details_prefix: str,
+        conservative: bool = False,
     ) -> tuple[str | None, bool]:
         """Apply two-tier cache lookup + compression to a single content string.
 
@@ -3130,11 +3286,14 @@ class ContentRouter(Transform):
                 route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
             return None, False
 
-        # Cache miss — run full compression
+        # Cache miss — run full compression (or conservative in stability phase)
         if route_counts is not None:
             route_counts["cache_miss"] = route_counts.get("cache_miss", 0) + 1
         t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias)
+        if conservative:
+            result = self._compress_conservative(content, context=context, bias=bias)
+        else:
+            result = self.compress(content, context=context, bias=bias)
         compress_ms = (time.perf_counter() - t0) * 1000
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
@@ -3153,8 +3312,11 @@ class ContentRouter(Transform):
                     f"{details_prefix}:{result.strategy_used.value}:{result.compression_ratio:.2f}"
                 )
             return result.compressed, True
-        # Didn't compress enough — add to skip set
-        self._cache.mark_skip(content_key)
+        # Didn't compress enough. In conservative (stability) mode, do NOT
+        # mark_skip — this content may be compressible via Kompress once the
+        # stability phase ends. Only skip genuine non-compressibles (full mode).
+        if not conservative:
+            self._cache.mark_skip(content_key)
         if route_counts is not None:
             route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
         return None, False
