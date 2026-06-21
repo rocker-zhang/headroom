@@ -41,6 +41,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -351,6 +352,10 @@ class CompressionCache:
         self._results: dict[int, tuple[str, float, str, float]] = {}
         # Tier 1: hashes of content that won't compress {hash: timestamp}
         self._skip: dict[int, float] = {}
+        # Callbacks invoked (outside the lock) whenever ``clear()`` runs, so
+        # sibling state keyed by the same content hashes (e.g. the router's
+        # frozen-verdict store) can be reset in lock-step with the cache.
+        self._on_clear: list[Any] = []
         self._ttl_seconds = ttl_seconds
         # Metrics
         self._hits = 0
@@ -439,11 +444,23 @@ class CompressionCache:
                 "cache_avg_lookup_ns": avg_ns,
             }
 
+    def register_on_clear(self, callback: Any) -> None:
+        """Register a callback fired (outside the lock) on every ``clear()``.
+
+        Lets state keyed by the same content hashes — e.g. the router's
+        ``_frozen_verdicts`` store — be reset together with the cache so it
+        cannot outlive the results/skip tiers it shadows.
+        """
+        self._on_clear.append(callback)
+
     def clear(self) -> None:
         """Clear all entries (e.g., on session end).  Thread-safe."""
         with self._lock:
             self._results.clear()
             self._skip.clear()
+        # Fire callbacks outside the lock to avoid cross-lock ordering issues.
+        for callback in self._on_clear:
+            callback()
 
 
 class CompressionStrategy(Enum):
@@ -989,7 +1006,49 @@ class ContentRouter(Transform):
         # sighting so it stops depending on the per-turn ``min_ratio`` drift.
         # Keyed by the same ``content_key`` as ``_cache``; value True =
         # "compress", False = "skip". Only populated when the flag is on.
+        #
+        # Bounding: this store shadows ``_cache`` entries, so left unbounded it
+        # would leak verdicts whose cache entries have long since expired. It is
+        # (a) cleared in lock-step with the cache via ``register_on_clear`` and
+        # (b) capped at ``_frozen_verdicts_max`` with simple insertion-order
+        # (FIFO) eviction, mirroring the cache's bounded posture.
+        #
+        # Locking: ``CompressionCache`` guards every mutation with a lock and
+        # the parallel compression pass writes verdicts from worker threads, so
+        # we match that posture with a dedicated lock rather than relying on
+        # GIL atomicity (which would not protect the read-then-evict sequence).
         self._frozen_verdicts: dict[int, bool] = {}
+        self._frozen_verdicts_max = 4096
+        self._frozen_lock = threading.Lock()
+        # Reset verdicts whenever the shadowed cache is cleared.
+        self._cache.register_on_clear(self._clear_frozen_verdicts)
+
+    def _record_frozen_verdict(self, content_key: int, verdict: bool) -> None:
+        """Record a frozen verdict (thread-safe, bounded FIFO eviction).
+
+        Caps the store at ``_frozen_verdicts_max`` entries, evicting the
+        oldest insertion when full, so it cannot grow without bound across a
+        long-lived process. Mirrors ``CompressionCache``'s locked mutations.
+        """
+        with self._frozen_lock:
+            if (
+                content_key not in self._frozen_verdicts
+                and len(self._frozen_verdicts) >= self._frozen_verdicts_max
+            ):
+                # Evict oldest insertion (dicts preserve insertion order).
+                oldest = next(iter(self._frozen_verdicts))
+                del self._frozen_verdicts[oldest]
+            self._frozen_verdicts[content_key] = verdict
+
+    def _get_frozen_verdict(self, content_key: int) -> bool | None:
+        """Read a frozen verdict (thread-safe). Returns None if absent."""
+        with self._frozen_lock:
+            return self._frozen_verdicts.get(content_key)
+
+    def _clear_frozen_verdicts(self) -> None:
+        """Drop all frozen verdicts (thread-safe). Fired on cache clear."""
+        with self._frozen_lock:
+            self._frozen_verdicts.clear()
 
     def _freeze_block_decision_enabled(self) -> bool:
         """Whether the per-block verdict freeze is active (default off).
@@ -2803,7 +2862,7 @@ class ContentRouter(Transform):
                 # only ever "compress" here (a "skip" verdict never warms the
                 # result cache), so this just pins the accept decision against
                 # ratio drift.
-                if freeze_decision and self._frozen_verdicts.get(content_key) is True:
+                if freeze_decision and self._get_frozen_verdict(content_key) is True:
                     accept_threshold = 1.0  # already-decided: always accept
                 else:
                     accept_threshold = frozen_threshold if freeze_decision else min_ratio
@@ -2830,7 +2889,7 @@ class ContentRouter(Transform):
                         # Freeze the "compress" verdict so future turns skip the
                         # min_ratio re-check above and never downgrade it.
                         if freeze_decision:
-                            self._frozen_verdicts[content_key] = True
+                            self._record_frozen_verdict(content_key, True)
                         if i in frozen_unlock_slots:
                             transforms_applied.append("router:netcost_frozen_unlock")
                             route_counts.setdefault("netcost_frozen_unlocked", 0)
@@ -2934,7 +2993,7 @@ class ContentRouter(Transform):
                     # Freeze "compress" so the cache-hit path above never
                     # re-applies a tighter min_ratio to this block.
                     if freeze_decision:
-                        self._frozen_verdicts[content_key] = True
+                        self._record_frozen_verdict(content_key, True)
                     if netcost_enabled and not self._net_cost_allows(
                         slot_idx=slot_idx,
                         original_tokens=tokenizer.count_text(task_content),
@@ -2973,7 +3032,7 @@ class ContentRouter(Transform):
                     # so we do NOT freeze it here (the byte-result skip cache
                     # entry can still expire/refresh per the existing TTL).
                     if freeze_decision and model_ready:
-                        self._frozen_verdicts[content_key] = False
+                        self._record_frozen_verdict(content_key, False)
 
         # Build final message list from slots
         transformed_messages = [m for m in result_slots if m is not None]
@@ -3347,6 +3406,20 @@ class ContentRouter(Transform):
             ``True`` the caller should update the block with the returned
             content and set ``any_compressed``.
         """
+        # Cache-churn fix (HEADROOM_FREEZE_BLOCK_DECISION, default off):
+        # mirror the plain-STRING path's per-block verdict freeze here, because
+        # for Claude Code / Anthropic traffic the prefix is dominated by
+        # ``tool_result`` content-blocks that flow through this helper. On first
+        # sighting the accept decision uses the FIXED ``frozen_threshold``
+        # instead of the drifting per-turn ``min_ratio``; the verdict is then
+        # recorded in ``_frozen_verdicts`` and reused on later turns so rising
+        # context pressure can no longer downgrade an accepted block (which
+        # would churn the prefix cache). Default off ⇒ legacy ``min_ratio``
+        # behaviour, byte-identical.
+        freeze_decision = self._freeze_block_decision_enabled()
+        frozen_threshold = self.config.min_ratio_aggressive
+        model_ready = self._kompress_model_ready() if freeze_decision else True
+
         # Tier 1: skip set — instant rejection
         if self._cache.is_skipped(content_key):
             if route_counts is not None:
@@ -3360,14 +3433,28 @@ class ContentRouter(Transform):
             cached_compressed, cached_ratio, cached_strategy = cached
             if route_counts is not None:
                 route_counts["cache_hit"] = route_counts.get("cache_hit", 0) + 1
-            if cached_ratio < min_ratio:
+            # If a "compress" verdict was frozen for this block, REUSE it and
+            # bypass the per-turn ``min_ratio`` re-check + ``move_to_skip``
+            # downgrade (the frozen verdict here is only ever "compress": a
+            # "skip" verdict never warms the result cache).
+            if freeze_decision and self._get_frozen_verdict(content_key) is True:
+                accept_threshold = 1.0  # already-decided: always accept
+            else:
+                accept_threshold = frozen_threshold if freeze_decision else min_ratio
+            if cached_ratio < accept_threshold:
                 transforms_applied.append(f"router:{strategy_label}:{cached_strategy}")
                 if compressed_details is not None:
                     compressed_details.append(
                         f"{details_prefix}:{cached_strategy}:{cached_ratio:.2f}"
                     )
+                # Freeze the "compress" verdict so future turns skip the
+                # min_ratio re-check above and never downgrade it.
+                if freeze_decision:
+                    self._record_frozen_verdict(content_key, True)
                 return cached_compressed, True
-            # Threshold tightened — move result to skip set
+            # Threshold tightened — move result to skip set.
+            # (Unreachable when the verdict is frozen-compress: the
+            # accept_threshold is pinned to 1.0 above.)
             self._cache.move_to_skip(content_key)
             if route_counts is not None:
                 route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
@@ -3385,7 +3472,10 @@ class ContentRouter(Transform):
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
             compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
-        if result.compression_ratio < min_ratio:
+        # First-sighting verdict uses the FIXED aggressive threshold when the
+        # freeze is on, else the legacy drifting ``min_ratio``.
+        accept_threshold = frozen_threshold if freeze_decision else min_ratio
+        if result.compression_ratio < accept_threshold:
             # Compressed — store in result cache
             self._cache.put(
                 content_key,
@@ -3393,6 +3483,10 @@ class ContentRouter(Transform):
                 result.compression_ratio,
                 result.strategy_used.value,
             )
+            # Freeze "compress" so the cache-hit path above never re-applies a
+            # tighter min_ratio to this block.
+            if freeze_decision:
+                self._record_frozen_verdict(content_key, True)
             transforms_applied.append(f"router:{strategy_label}:{result.strategy_used.value}")
             if compressed_details is not None:
                 compressed_details.append(
@@ -3406,6 +3500,11 @@ class ContentRouter(Transform):
             self._cache.mark_skip(content_key)
         if route_counts is not None:
             route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
+        # Caveat (1): only freeze a "skip" verdict when the ML model is actually
+        # ready. A passthrough caused purely by a still-loading ModernBERT must
+        # stay re-evaluable on later turns, so we do NOT freeze it here.
+        if freeze_decision and model_ready:
+            self._record_frozen_verdict(content_key, False)
         return None, False
 
     def _detect_analysis_intent(self, messages: list[dict[str, Any]]) -> bool:
