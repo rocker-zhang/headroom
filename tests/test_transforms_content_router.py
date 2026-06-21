@@ -840,11 +840,13 @@ def test_freeze_on_pins_compress_verdict_across_turns(
 def test_freeze_on_pins_passthrough_verdict_across_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """(a) Flag ON, mid-zone block (ratio 0.75): under the FIXED aggressive
-    threshold (0.65) the block does NOT compress on first sighting, so the
-    frozen verdict is passthrough and stays passthrough on every later turn
-    — no flip to compressed even as pressure rises. (Contrast with the
-    flag-off baseline which compresses turn 1.)"""
+    """(a) Flag ON, mid-zone block (ratio 0.75): the RELAXED first-sighting
+    threshold (0.85) compresses it on turn 1 (low pressure), freezes the
+    compress verdict, and PINS it compressed on every later turn — even as
+    rising pressure pulls ``min_ratio`` below 0.75, where the flag-off path
+    would ``move_to_skip`` and bust the prefix cache. So the bytes stay
+    compressed and identical, and the freeze-pin counter records the
+    busts it avoided. (Contrast with the flag-off flapping baseline.)"""
     monkeypatch.setenv("HEADROOM_FREEZE_BLOCK_DECISION", "1")
     router = _churn_router(monkeypatch, ratio=0.75)
     content = _content_of_n_words(200)
@@ -858,8 +860,9 @@ def test_freeze_on_pins_passthrough_verdict_across_turns(
         ).messages[0]["content"]
         outs.append(out)
 
-    assert all(o == content for o in outs), "verdict must stay passthrough"
-    assert len(set(outs)) == 1, "bytes identical (always original) across turns"
+    assert all(o.startswith("[C]") for o in outs), "verdict must stay compressed"
+    assert len(set(outs)) == 1, "bytes identical (always compressed) across turns"
+    assert router._freeze_pin_hits > 0, "freeze must pin compress over a tightening min_ratio"
 
 
 def test_model_not_ready_passthrough_is_not_frozen(
@@ -988,16 +991,19 @@ def test_block_freeze_on_pins_compress_verdict_across_turns(
 def test_block_freeze_on_pins_passthrough_verdict_across_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """(a) Block path, flag ON, mid-zone block (ratio 0.75): under the FIXED
-    aggressive threshold (0.65) it does not compress on first sighting, so the
-    frozen verdict is passthrough and stays passthrough on every later turn."""
+    """(a) Block path, flag ON, mid-zone block (ratio 0.75): the RELAXED
+    first-sighting threshold (0.85) compresses it on turn 1, freezes the
+    compress verdict, and pins it compressed on every later turn even as
+    rising pressure pulls min_ratio below 0.75 (where flag-off would
+    move_to_skip). Bytes stay compressed/identical and pins are recorded."""
     monkeypatch.setenv("HEADROOM_FREEZE_BLOCK_DECISION", "1")
     router = _churn_router(monkeypatch, ratio=0.75)
     content = _content_of_n_words(200)
 
     outs = [_block_out(router, content, model_limit=limit) for limit in (100000, 1000, 300, 100)]
-    assert all(o == content for o in outs), "verdict must stay passthrough"
-    assert len(set(outs)) == 1, "block bytes identical (original) across turns"
+    assert all(o.startswith("[C]") for o in outs), "verdict must stay compressed"
+    assert len(set(outs)) == 1, "block bytes identical (compressed) across turns"
+    assert router._freeze_pin_hits > 0, "freeze must pin compress over a tightening min_ratio"
 
 
 def test_block_model_not_ready_passthrough_is_not_frozen(

@@ -1022,6 +1022,31 @@ class ContentRouter(Transform):
         self._frozen_lock = threading.Lock()
         # Reset verdicts whenever the shadowed cache is cleared.
         self._cache.register_on_clear(self._clear_frozen_verdicts)
+        # Instrumentation for the freeze (HEADROOM_FREEZE_BLOCK_DECISION): a
+        # "pin" is a turn where the frozen compress verdict overrode a tightened
+        # per-turn ``min_ratio`` that would otherwise downgrade the block to
+        # skip — i.e. revert it to original text and bust the provider prefix
+        # cache. Counting pins isolates the freeze's attributable payoff.
+        self._freeze_pin_hits = 0
+        self._freeze_pin_chars = 0
+
+    def _record_freeze_pin(self, content: str, cached_ratio: float) -> None:
+        """Count one freeze divergence (thread-safe) and log it.
+
+        Fires only when the frozen "compress" verdict overrode a tightened
+        per-turn ``min_ratio`` that would have downgraded the block to skip (a
+        provider cache bust). ``preserved`` is a char-based proxy for the
+        compression saving kept alive by not reverting to the original.
+        """
+        preserved = max(0, int(len(content) * (1.0 - cached_ratio)))
+        with self._frozen_lock:
+            self._freeze_pin_hits += 1
+            self._freeze_pin_chars += preserved
+            hits = self._freeze_pin_hits
+        logger.info(
+            f"FREEZE-PIN: pins={hits} cached_ratio={cached_ratio:.3f} "
+            f"preserved_chars~={preserved} (cache bust avoided)"
+        )
 
     def _record_frozen_verdict(self, content_key: int, verdict: bool) -> None:
         """Record a frozen verdict (thread-safe, bounded FIFO eviction).
@@ -2579,18 +2604,25 @@ class ContentRouter(Transform):
             min(self.config.min_ratio_relaxed, min_ratio),
         )
 
-        # Cache-churn fix: when frozen-decision mode is on, the accept gate
-        # uses a FIXED threshold (the aggressive end, 0.65) instead of the
-        # drifting ``min_ratio``. This freezes a block's compress/skip verdict
-        # across turns so the prefix stops churning the cache. It is a
-        # stability/ratio TRADE, not a free ratio win: the aggressive end is the
-        # MOST restrictive accept threshold, so a borderline block (~0.65-0.85)
-        # that the drifting gate would compress at low pressure is passed through
-        # instead — trading a little bytes-saved for a stable, cache-friendly
-        # prefix. Default off ⇒ this is never read and the legacy ``min_ratio``
-        # path is untouched.
+        # Cache-churn fix: when frozen-decision mode is on, accept/skip
+        # decisions use the SAME live ``min_ratio`` gate as flag-off, but once a
+        # block is accepted-and-compressed its "compress" verdict is pinned
+        # (accept_threshold=1.0) on every later turn. So when rising pressure
+        # tightens ``min_ratio`` below the block's ratio — the turn the legacy
+        # path would ``move_to_skip`` and bust the provider prefix cache — the
+        # pin keeps it compressed instead. This is a pure pin: it preserves a
+        # decision the live gate already made; it never loosens the first-sight
+        # gate (which would be a silent ratio bet).
+        #
+        # (Earlier this used a FIXED ``frozen_threshold`` == the ``min_ratio``
+        # aggressive floor (0.65), which made the pin dead code — a block only
+        # froze when ``cached_ratio < 0.65 <= min_ratio``, one the legacy gate
+        # accepts anyway, so the pin never changed an outcome and the flag only
+        # suppressed borderline compression. Verified inert by A/B 2026-06-21.)
+        #
+        # Default off ⇒ the pin branch is never taken and the legacy
+        # ``min_ratio`` path is byte-for-byte untouched.
         freeze_decision = self._freeze_block_decision_enabled()
-        frozen_threshold = self.config.min_ratio_aggressive
         model_ready = self._kompress_model_ready() if freeze_decision else True
 
         if context_pressure > 0.3:
@@ -2867,12 +2899,20 @@ class ContentRouter(Transform):
                 # only ever "compress" here (a "skip" verdict never warms the
                 # result cache), so this just pins the accept decision against
                 # ratio drift.
-                if freeze_decision and self._get_frozen_verdict(content_key) is True:
-                    accept_threshold = 1.0  # already-decided: always accept
+                frozen_compress = (
+                    freeze_decision and self._get_frozen_verdict(content_key) is True
+                )
+                if frozen_compress:
+                    # Pin: a frozen "compress" verdict always re-accepts,
+                    # overriding the per-turn min_ratio re-check below.
+                    accept_threshold = 1.0
                 else:
-                    accept_threshold = frozen_threshold if freeze_decision else min_ratio
+                    # Pre-freeze / unfrozen: identical to the legacy gate. The
+                    # freeze only PINS past accepts; it never loosens the
+                    # first-sighting decision (that would be a silent ratio bet).
+                    accept_threshold = min_ratio
                 # Re-check ratio against the active threshold (shifts with
-                # context pressure unless frozen).
+                # context pressure unless pinned by a frozen verdict).
                 if cached_ratio < accept_threshold:
                     if netcost_enabled and not self._net_cost_allows(
                         slot_idx=i,
@@ -2895,6 +2935,12 @@ class ContentRouter(Transform):
                         # min_ratio re-check above and never downgrade it.
                         if freeze_decision:
                             self._record_frozen_verdict(content_key, True)
+                        # Pin attribution: count a bust avoided only when the
+                        # block actually stayed compressed (past the net-cost
+                        # gate) AND the frozen verdict overrode a tightened
+                        # min_ratio that flag-off would have moved to skip.
+                        if frozen_compress and cached_ratio >= min_ratio:
+                            self._record_freeze_pin(content, cached_ratio)
                         if i in frozen_unlock_slots:
                             transforms_applied.append("router:netcost_frozen_unlock")
                             route_counts.setdefault("netcost_frozen_unlocked", 0)
@@ -2980,15 +3026,12 @@ class ContentRouter(Transform):
                     compressor_timing.get(strategy_key, 0.0) + compress_ms
                 )
 
-                # Cache-churn fix: first-sighting verdict uses the FIXED
-                # aggressive threshold (the aggressive end, 0.65) instead of the
-                # drifting ``min_ratio``. This is a stability/ratio TRADE, not a
-                # free ratio win: the aggressive end is the MOST restrictive accept
-                # threshold, so a borderline block the drifting gate would compress
-                # at low pressure is passed through instead — trading a little
-                # bytes-saved for a stable, cache-friendly prefix. Default off ⇒
-                # legacy ``min_ratio``.
-                accept_threshold = frozen_threshold if freeze_decision else min_ratio
+                # Cache-churn fix (pure pin): first-sighting uses the SAME live
+                # ``min_ratio`` gate as flag-off — the freeze never loosens the
+                # first decision. It only records the resulting "compress"
+                # verdict so the cache-hit path above can PIN it and stop a later
+                # tighter ``min_ratio`` from downgrading it. Default off ⇒ legacy.
+                accept_threshold = min_ratio
                 if result.compression_ratio < accept_threshold:
                     # Compressed — store in result cache. The cache is still
                     # warmed when the net-cost gate blocks the slot: the
@@ -3419,15 +3462,16 @@ class ContentRouter(Transform):
         # Cache-churn fix (HEADROOM_FREEZE_BLOCK_DECISION, default off):
         # mirror the plain-STRING path's per-block verdict freeze here, because
         # for Claude Code / Anthropic traffic the prefix is dominated by
-        # ``tool_result`` content-blocks that flow through this helper. On first
-        # sighting the accept decision uses the FIXED ``frozen_threshold``
-        # instead of the drifting per-turn ``min_ratio``; the verdict is then
-        # recorded in ``_frozen_verdicts`` and reused on later turns so rising
-        # context pressure can no longer downgrade an accepted block (which
-        # would churn the prefix cache). Default off ⇒ legacy ``min_ratio``
+        # ``tool_result`` content-blocks that flow through this helper. This is a
+        # pure pin: accept/skip uses the SAME live ``min_ratio`` gate as
+        # flag-off, and an accepted "compress" verdict is recorded in
+        # ``_frozen_verdicts`` and pinned on later turns so rising context
+        # pressure can no longer downgrade it (which would churn the prefix
+        # cache). The freeze never loosens the first-sighting decision. See the
+        # STRING-path note above for why the old fixed aggressive threshold
+        # (0.65) made the pin dead code. Default off ⇒ legacy ``min_ratio``
         # behaviour, byte-identical.
         freeze_decision = self._freeze_block_decision_enabled()
-        frozen_threshold = self.config.min_ratio_aggressive
         model_ready = self._kompress_model_ready() if freeze_decision else True
 
         # Tier 1: skip set — instant rejection
@@ -3449,8 +3493,16 @@ class ContentRouter(Transform):
             # "skip" verdict never warms the result cache).
             if freeze_decision and self._get_frozen_verdict(content_key) is True:
                 accept_threshold = 1.0  # already-decided: always accept
+                if cached_ratio >= min_ratio:
+                    # Counterfactual: legacy min_ratio re-check would downgrade
+                    # this block (move_to_skip → original restored → prefix
+                    # cache bust). The frozen verdict prevented it. The block
+                    # path has no net-cost veto, so an accepted frozen block
+                    # always stays compressed — this pin count is exact.
+                    self._record_freeze_pin(content, cached_ratio)
             else:
-                accept_threshold = frozen_threshold if freeze_decision else min_ratio
+                # Pre-freeze / unfrozen: same live gate as flag-off (pure pin).
+                accept_threshold = min_ratio
             if cached_ratio < accept_threshold:
                 transforms_applied.append(f"router:{strategy_label}:{cached_strategy}")
                 if compressed_details is not None:
@@ -3482,9 +3534,9 @@ class ContentRouter(Transform):
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"
             compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
-        # First-sighting verdict uses the FIXED aggressive threshold when the
-        # freeze is on, else the legacy drifting ``min_ratio``.
-        accept_threshold = frozen_threshold if freeze_decision else min_ratio
+        # First-sighting uses the live ``min_ratio`` gate (same as flag-off);
+        # the freeze only pins the resulting verdict, it never loosens this gate.
+        accept_threshold = min_ratio
         if result.compression_ratio < accept_threshold:
             # Compressed — store in result cache
             self._cache.put(
