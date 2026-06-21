@@ -612,6 +612,12 @@ class HeadroomProxy(
         profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
+            prefer_code_aware_for_code=os.environ.get(
+                "HEADROOM_PREFER_CODE_AWARE_FOR_CODE", ""
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on"),
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
             smart_crusher_max_items_after_crush=cast(
