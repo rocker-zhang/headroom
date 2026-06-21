@@ -2580,10 +2580,15 @@ class ContentRouter(Transform):
         )
 
         # Cache-churn fix: when frozen-decision mode is on, the accept gate
-        # uses a FIXED threshold (the aggressive end) instead of the drifting
-        # ``min_ratio``. Aggressive end ⇒ ratio-neutral-or-better: a block at
-        # the boundary compresses rather than flapping. Default off ⇒ this is
-        # never read and the legacy ``min_ratio`` path is untouched.
+        # uses a FIXED threshold (the aggressive end, 0.65) instead of the
+        # drifting ``min_ratio``. This freezes a block's compress/skip verdict
+        # across turns so the prefix stops churning the cache. It is a
+        # stability/ratio TRADE, not a free ratio win: the aggressive end is the
+        # MOST restrictive accept threshold, so a borderline block (~0.65-0.85)
+        # that the drifting gate would compress at low pressure is passed through
+        # instead — trading a little bytes-saved for a stable, cache-friendly
+        # prefix. Default off ⇒ this is never read and the legacy ``min_ratio``
+        # path is untouched.
         freeze_decision = self._freeze_block_decision_enabled()
         frozen_threshold = self.config.min_ratio_aggressive
         model_ready = self._kompress_model_ready() if freeze_decision else True
@@ -2976,8 +2981,13 @@ class ContentRouter(Transform):
                 )
 
                 # Cache-churn fix: first-sighting verdict uses the FIXED
-                # aggressive threshold (ratio-neutral-or-better) instead of
-                # the drifting ``min_ratio``. Default off ⇒ legacy ``min_ratio``.
+                # aggressive threshold (the aggressive end, 0.65) instead of the
+                # drifting ``min_ratio``. This is a stability/ratio TRADE, not a
+                # free ratio win: the aggressive end is the MOST restrictive accept
+                # threshold, so a borderline block the drifting gate would compress
+                # at low pressure is passed through instead — trading a little
+                # bytes-saved for a stable, cache-friendly prefix. Default off ⇒
+                # legacy ``min_ratio``.
                 accept_threshold = frozen_threshold if freeze_decision else min_ratio
                 if result.compression_ratio < accept_threshold:
                     # Compressed — store in result cache. The cache is still
