@@ -102,141 +102,36 @@ def _tree_sitter_importable() -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Node-API adapter
-#
-# ``tree_sitter_language_pack`` (Kreuzberg build, >=1.x) ships its own Rust
-# binding whose ``Parser``/``Tree``/``Node`` are NOT the stock
-# ``tree_sitter.*`` objects this module's tree-walking code was written
-# against.  Concretely the pack's Node exposes *methods* (``.kind()``,
-# ``.byte_range()``, ``.start_position()``, ``.child(i)``) instead of the
-# stock *properties* (``.type``, ``.start_byte``, ``.start_point``,
-# ``.children``) and has no ``.text``.  The old code built a stock
-# ``tree_sitter.Parser`` and assigned ``get_language()`` to it, which raises
-# ``TypeError: language must be assigned a tree_sitter.Language object`` and
-# was silently swallowed into a lossy fallback.
-#
-# We instead obtain the pack's real, working parser via ``get_parser()`` and
-# wrap its output in thin adapters that present the stock ``tree_sitter`` Node
-# API.  This keeps every call site unchanged while making real AST parsing
-# run for supported languages.
-# ---------------------------------------------------------------------------
-
-
-class _NodeAdapter:
-    """Adapts a pack Node to the stock ``tree_sitter.Node`` property API."""
-
-    __slots__ = ("_n", "_src")
-
-    def __init__(self, node: Any, source: bytes) -> None:
-        self._n = node
-        self._src = source
-
-    @property
-    def type(self) -> str:
-        return self._n.kind()
-
-    @property
-    def start_byte(self) -> int:
-        return self._n.byte_range().start
-
-    @property
-    def end_byte(self) -> int:
-        return self._n.byte_range().end
-
-    @property
-    def start_point(self) -> tuple[int, int]:
-        p = self._n.start_position()
-        return (p.row, p.column)
-
-    @property
-    def end_point(self) -> tuple[int, int]:
-        p = self._n.end_position()
-        return (p.row, p.column)
-
-    @property
-    def text(self) -> bytes:
-        return self._src[self._n.byte_range().start : self._n.byte_range().end]
-
-    @property
-    def is_named(self) -> bool:
-        return self._n.is_named()
-
-    @property
-    def is_missing(self) -> bool:
-        return self._n.is_missing()
-
-    @property
-    def child_count(self) -> int:
-        return self._n.child_count()
-
-    @property
-    def children(self) -> list[_NodeAdapter]:
-        n = self._n
-        return [_NodeAdapter(n.child(i), self._src) for i in range(n.child_count())]
-
-
-class _TreeAdapter:
-    """Adapts a pack Tree so ``.root_node`` is a stock-style property."""
-
-    __slots__ = ("_t", "_src")
-
-    def __init__(self, tree: Any, source: bytes) -> None:
-        self._t = tree
-        self._src = source
-
-    @property
-    def root_node(self) -> _NodeAdapter:
-        return _NodeAdapter(self._t.root_node(), self._src)
-
-
-class _ParserAdapter:
-    """Adapts a pack Parser to ``parse(bytes) -> stock-style Tree``."""
-
-    __slots__ = ("_p",)
-
-    def __init__(self, parser: Any) -> None:
-        self._p = parser
-
-    def parse(self, source: bytes | str) -> _TreeAdapter:
-        if isinstance(source, bytes):
-            src_bytes = source
-            text = source.decode("utf-8", errors="surrogatepass")
-        else:
-            text = source
-            src_bytes = source.encode("utf-8")
-        tree = self._p.parse(text)
-        return _TreeAdapter(tree, src_bytes)
-
-
 def _get_parser(language: str) -> Any:
     """Get a tree-sitter parser for the given language.
 
-    Returns a **thread-local** parser adapter that exposes the stock
-    ``tree_sitter`` Node API (``.type``/``.children``/``.start_byte``/...)
-    regardless of the underlying grammar-pack binding.
+    Returns a **thread-local** ``tree_sitter.Parser`` instance.
 
-    We obtain the parser from ``tree_sitter_language_pack.get_parser()`` (the
-    pack's own, working constructor) rather than building a stock
-    ``tree_sitter.Parser`` and assigning a foreign ``Language`` object to it,
-    which raised ``TypeError`` and was silently downgraded to a lossy
-    fallback.  Output is wrapped by :class:`_ParserAdapter` so all existing
-    tree-walking code keeps working unchanged.
+    tree-sitter ≥ 0.23 wraps the C ``TSParser`` in a PyO3
+    ``#[pyclass(unsendable)]`` which hard-panics if the object is accessed
+    from any thread other than its creator.  Because Headroom runs
+    compression inside a ``ThreadPoolExecutor``, a single shared parser
+    would be touched from arbitrary pool threads → instant crash.
 
-    Parsers are cached per (thread, language). The pack's parser, like the
-    stock one, is not safe to share across threads, so thread-local storage
-    satisfies that contract with negligible extra memory.
+    We use the stock ``tree_sitter.Parser`` (which returns standard
+    ``tree_sitter.Node`` / ``tree_sitter.Tree`` with property access) and
+    set its language via ``tree_sitter_language_pack.get_language()``.
+    Storing one parser per (thread, language) satisfies the ``unsendable``
+    contract with negligible extra memory.
 
     Args:
         language: Language name (e.g., 'python', 'javascript').
 
     Returns:
-        A parser adapter bound to the current thread.
+        Configured ``tree_sitter.Parser`` bound to the current thread.
 
     Raises:
         ImportError: If tree-sitter is not installed.
         ValueError: If language is not supported.
     """
+    # NOTE: guard on importability (not _check_tree_sitter_available), because
+    # _check_tree_sitter_available now performs a real end-to-end parse via
+    # _get_parser; guarding on it here would recurse.
     if not _tree_sitter_importable():
         raise ImportError(
             "tree-sitter is not installed. Install with: pip install headroom-ai[code]\n"
@@ -250,12 +145,14 @@ def _get_parser(language: str) -> Any:
 
     if language not in parsers:
         try:
-            from tree_sitter_language_pack import get_parser
+            from tree_sitter import Parser
+            from tree_sitter_language_pack import get_language
 
-            # `language` is a validated runtime str; get_parser types its arg
+            parser = Parser()
+            # `language` is a validated runtime str; get_language types its arg
             # as a Literal of supported names, which a dynamic str can't satisfy.
-            raw_parser = get_parser(language)  # type: ignore[arg-type]
-            parsers[language] = _ParserAdapter(raw_parser)
+            parser.language = get_language(language)  # type: ignore[arg-type]
+            parsers[language] = parser
             logger.debug(
                 "Loaded tree-sitter parser for %s (thread %s)",
                 language,
