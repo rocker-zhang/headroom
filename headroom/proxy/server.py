@@ -612,9 +612,7 @@ class HeadroomProxy(
         profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
-            prefer_code_aware_for_code=os.environ.get(
-                "HEADROOM_PREFER_CODE_AWARE_FOR_CODE", ""
-            )
+            prefer_code_aware_for_code=os.environ.get("HEADROOM_PREFER_CODE_AWARE_FOR_CODE", "")
             .strip()
             .lower()
             in ("1", "true", "yes", "on"),

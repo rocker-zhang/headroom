@@ -704,9 +704,7 @@ class ContentRouterConfig:
     # 999 = never compress any (explicit backward-compat escape hatch).
     # Env var: HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS (default 0 = off).
     stale_read_compress_after_turns: int = field(
-        default_factory=lambda: int(
-            os.environ.get("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0")
-        )
+        default_factory=lambda: int(os.environ.get("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"))
     )
 
     # Compression stability pinning: in the first N turns of a session, use a
@@ -716,9 +714,7 @@ class ContentRouterConfig:
     # 0 = disabled (all turns get full compression — previous behavior).
     # Env var: HEADROOM_COMPRESSION_STABLE_AFTER_TURN (default 0 = off).
     compression_stable_after_turn: int = field(
-        default_factory=lambda: int(
-            os.environ.get("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0")
-        )
+        default_factory=lambda: int(os.environ.get("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"))
     )
 
     # Adaptive compression ratio: scales with context pressure.
@@ -2939,9 +2935,7 @@ class ContentRouter(Transform):
                 # only ever "compress" here (a "skip" verdict never warms the
                 # result cache), so this just pins the accept decision against
                 # ratio drift.
-                frozen_compress = (
-                    freeze_decision and self._get_frozen_verdict(content_key) is True
-                )
+                frozen_compress = freeze_decision and self._get_frozen_verdict(content_key) is True
                 if frozen_compress:
                     # Pin: a frozen "compress" verdict always re-accepts,
                     # overriding the per-turn min_ratio re-check below.

@@ -268,7 +268,9 @@ class TestStabilityPhaseApply:
 class TestStabilityPhaseAnthropic:
     """Stability phase applies to Anthropic content-block tool_result outputs."""
 
-    def _build_anthropic_msgs(self, n_turns: int, tool_name: str = "WebFetch") -> list[dict[str, Any]]:
+    def _build_anthropic_msgs(
+        self, n_turns: int, tool_name: str = "WebFetch"
+    ) -> list[dict[str, Any]]:
         msgs: list[dict[str, Any]] = [_user_message("start")]
         for t in range(n_turns):
             tc_id = f"tc_{t}"

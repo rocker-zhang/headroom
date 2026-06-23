@@ -1287,9 +1287,7 @@ function _internalDebug(msg) {
 # =============================================================================
 
 
-@pytest.mark.skipif(
-    not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed"
-)
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
 class TestRealASTRuns:
     """Guards against the regression where the code-aware compressor silently
     fell back to a lossy stripper because ``_get_parser`` built a stock
@@ -1349,9 +1347,7 @@ class TestRealASTRuns:
     def test_ast_runs_for_python_no_fallback(self):
         """A supported language must be compressed via real AST, not the
         UNKNOWN-language Kompress fallback."""
-        result = self._compressor().compress(
-            _payment_processing_code(), language="python"
-        )
+        result = self._compressor().compress(_payment_processing_code(), language="python")
 
         # The fallback path forces language=UNKNOWN and syntax_valid=False.
         # Real AST keeps the detected language and guarantees valid syntax.
