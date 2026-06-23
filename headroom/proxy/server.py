@@ -1609,6 +1609,14 @@ class HeadroomProxy(
                 last_error = e
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
+                    # On exhaustion, preserve the upstream status (e.g. 529
+                    # Overloaded, 503 Service Unavailable) so the client can
+                    # apply its own retry/backoff. Collapsing every exhausted
+                    # 5xx into a generic 502 hides the retryable signal and
+                    # makes clients give up. ConnectError/TimeoutException
+                    # carry no response, so those still raise.
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        return e.response
                     raise
 
                 # Exponential backoff with jitter
