@@ -133,6 +133,24 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     return result
 
 
+def _to_int(value: object, default: int = 0) -> int:
+    """Tolerant int parse for PERF log values.
+
+    A line-final numeric field can absorb trailing punctuation when the PERF
+    text is emitted inside a JSON wrapper (e.g. ``cache_write=88742"}``), which
+    would crash a bare ``int()``. Extract the leading integer and fall back to
+    ``default`` if there is none.
+    """
+    match = re.match(r"-?\d+", str(value).strip())
+    return int(match.group()) if match else default
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    """Tolerant float parse for PERF log values (see ``_to_int``)."""
+    match = re.match(r"-?\d+(?:\.\d+)?", str(value).strip())
+    return float(match.group()) if match else default
+
+
 @dataclass
 class PerfRecord:
     """A single parsed PERF log entry."""
@@ -332,18 +350,18 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 request_id=m.group("rid"),
                                 model=kv.get("model", ""),
                                 client=kv.get("client", ""),
-                                num_messages=int(kv.get("msgs", 0)),
-                                tokens_before=int(kv.get("tok_before", 0)),
-                                tokens_after=int(kv.get("tok_after", 0)),
-                                tokens_saved=int(kv.get("tok_saved", 0)),
-                                cache_read=int(kv.get("cache_read", 0)),
-                                cache_write=int(kv.get("cache_write", 0)),
-                                cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
-                                optimization_ms=float(kv.get("opt_ms", 0)),
+                                num_messages=_to_int(kv.get("msgs", 0)),
+                                tokens_before=_to_int(kv.get("tok_before", 0)),
+                                tokens_after=_to_int(kv.get("tok_after", 0)),
+                                tokens_saved=_to_int(kv.get("tok_saved", 0)),
+                                cache_read=_to_int(kv.get("cache_read", 0)),
+                                cache_write=_to_int(kv.get("cache_write", 0)),
+                                cache_hit_pct=_to_int(kv.get("cache_hit_pct", 0)),
+                                optimization_ms=_to_float(kv.get("opt_ms", 0)),
                                 transforms=transforms,
-                                total_ms=float(kv.get("total_ms", 0)),
-                                tokens_out=int(kv.get("tok_out", 0)),
-                                ttfb_ms=float(kv.get("ttfb_ms", 0)),
+                                total_ms=_to_float(kv.get("total_ms", 0)),
+                                tokens_out=_to_int(kv.get("tok_out", 0)),
+                                ttfb_ms=_to_float(kv.get("ttfb_ms", 0)),
                                 stages=stages_by_rid.get(m.group("rid"), {}),
                             )
                         )
